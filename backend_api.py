@@ -13,6 +13,13 @@ import glob
 from dotenv import load_dotenv
 import logging
 
+# Production configuration
+if os.environ.get('RENDER'):
+    # Running on Render
+    os.makedirs("/tmp/documents", exist_ok=True)
+    os.makedirs("/tmp/chroma_db", exist_ok=True)
+
+
 # Load environment variables
 load_dotenv()
 
@@ -29,10 +36,12 @@ vectorstore = None
 
 def setup_document_samples():
     """Create sample documents for the assistant"""
-    os.makedirs("documents", exist_ok=True)
+    # Use /tmp for temporary storage on Render
+    doc_path = "/tmp/documents" if os.environ.get('RENDER') else "documents"
+    os.makedirs(doc_path, exist_ok=True)
     
     # Create sample return policy
-    with open("documents/return_policy.txt", "w") as f:
+    with open(f"{doc_path}/return_policy.txt", "w") as f:
         f.write("""
 Walmart Return Policy
 
@@ -49,7 +58,7 @@ Exclusions:
 - Perishable goods
 """)
        
-    with open("documents/walmart_points_logic.txt", "w") as f:
+    with open(f"{doc_path}/return_policy.txt", "w") as f:
         f.write("""
 Walmart Points System
 
@@ -61,7 +70,7 @@ Walmart Points System
 """)
         
     # Create sample shipping policy
-    with open("documents/shipping_policy.txt", "w") as f:
+    with open(f"{doc_path}/return_policy.txt", "w") as f:
         f.write("""
 Walmart Shipping Options
 
@@ -87,7 +96,7 @@ International Shipping:
 """)
     
     # Create sample product catalog
-    with open("documents/product_catalog.txt", "w") as f:
+    with open(f"{doc_path}/return_policy.txt", "w") as f:
         f.write("""
 Walmart Electronics Catalog
 
@@ -109,7 +118,7 @@ Walmart Electronics Catalog
    - Features: Air fry, roast, bake, toast, dehydrate functions, 1800W power
 """)
     
-    with open("documents/store_hours.txt", "w") as f:
+    with open(f"{doc_path}/return_policy.txt", "w") as f:
         f.write("""
 Walmart Store Hours
 
