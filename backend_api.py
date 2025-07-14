@@ -262,15 +262,29 @@ def chat():
         question = data.get('question', '').strip()
         
         if not question:
-            return jsonify({"error": "No question provided"}), 400
+            logger.warning("Received empty question.")
+            return jsonify({
+                "answer": "Please enter a valid question.",
+                "sources": [],
+                "status": "error"
+            }), 400
         
         if not qa_chain:
-            return jsonify({"error": "QA system not initialized"}), 500
+            logger.error("QA system not initialized.")
+            return jsonify({
+                "answer": "Kendall is not ready yet. Please try again shortly.",
+                "sources": [],
+                "status": "error"
+            }), 500
         
         # Get answer from QA system
         result = qa_chain({"query": question})
-        answer = result["result"]
         
+        answer = result.get("result", "").strip()
+        if not answer:
+            logger.warning("QA system returned empty answer.")
+            answer = "I couldn't find a helpful answer for that. Please try rephrasing your question."
+
         # Extract sources
         sources = []
         if "source_documents" in result:
@@ -278,7 +292,7 @@ def chat():
                 os.path.basename(doc.metadata.get('source', 'Unknown'))
                 for doc in result["source_documents"]
             ]))
-        
+
         return jsonify({
             "answer": answer,
             "sources": sources,
@@ -286,9 +300,10 @@ def chat():
         })
         
     except Exception as e:
-        logger.error(f"Error in chat endpoint: {str(e)}")
+        logger.exception("Error in chat endpoint")
         return jsonify({
-            "error": "Sorry, I'm having trouble processing your request right now.",
+            "answer": "Sorry, I'm having trouble processing your request right now. Please try again later.",
+            "sources": [],
             "status": "error"
         }), 500
 
