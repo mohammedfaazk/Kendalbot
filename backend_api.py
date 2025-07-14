@@ -1,6 +1,9 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
+import glob
+import logging
+from dotenv import load_dotenv
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -9,327 +12,200 @@ from langchain.prompts import PromptTemplate
 from langchain_groq import ChatGroq
 from langchain.chains import RetrievalQA
 from langchain.schema import Document
-import glob
-from dotenv import load_dotenv
-import logging
-
-# Production configuration
-if os.environ.get('RENDER'):
-    # Running on Render
-    os.makedirs("/tmp/documents", exist_ok=True)
-    os.makedirs("/tmp/chroma_db", exist_ok=True)
-
 
 # Load environment variables
 load_dotenv()
 
-# Setup logging
+# Setup Flask and CORS
+app = Flask(__name__)
+CORS(app)
+
+# Logging config
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
-
-# Global variables for QA chain
+# Global state
 qa_chain = None
 vectorstore = None
 
-def setup_document_samples():
-    """Create sample documents for the assistant"""
-    # Use /tmp for temporary storage on Render
-    doc_path = "/tmp/documents" if os.environ.get('RENDER') else "documents"
-    os.makedirs(doc_path, exist_ok=True)
-    
-    # Create sample return policy
-    with open(f"{doc_path}/return_policy.txt", "w") as f:
-        f.write("""
+# Determine doc path based on environment
+DOC_PATH = "/tmp/documents" if os.environ.get("RENDER") else "documents"
+DB_PATH = "/tmp/chroma_db" if os.environ.get("RENDER") else "./chroma_db"
+os.makedirs(DOC_PATH, exist_ok=True)
+os.makedirs(DB_PATH, exist_ok=True)
+
+
+def create_sample_documents():
+    """Generate static example documents in DOC_PATH"""
+    docs = {
+        "return_policy.txt": """
 Walmart Return Policy
-
-1. Most items can be returned within 90 days of purchase
-2. Electronics must be returned within 30 days
-3. Items must be in original packaging with all accessories
-4. Receipt or order number required for returns
-5. Refunds issued to original payment method within 5-7 business days
-
-Exclusions:
-- Opened software, movies, and music
-- Gift cards
-- Personalized items
-- Perishable goods
-""")
-       
-    with open(f"{doc_path}/return_policy.txt", "w") as f:
-        f.write("""
+1. Most items: return within 90 days
+2. Electronics: return within 30 days
+3. Must have original packaging and receipt
+4. Refund in 5–7 business days
+""",
+        "points_system.txt": """
 Walmart Points System
+- Purchases: Earn 5% of MRP
+- Recycling: Earn 50% of product value
+- Returns: Deduct 1.5x earned points
+- Tiers: Silver/Gold for perks
+""",
+        "shipping.txt": """
+Shipping Options
+- Free over $35: 3–5 days
+- Express: $5.99, 2-day
+- NextDay: $8.99, by 9PM
+- International: Custom rates
+""",
+        "store_hours.txt": """
+Store Hours
+- Open: 6AM–11PM daily
+- Pharmacy: 9AM–8PM
+- Holidays: Closed on major holidays
+""",
+    }
+    for filename, content in docs.items():
+        with open(os.path.join(DOC_PATH, filename), "w") as f:
+            f.write(content)
+    logger.info("Sample documents created.")
 
-- Purchasing: Earn 5 percent of product MRP in points
-- Recycling: Earn 50 percent of current product value in points
-- Returns: Deduct 1.5x points earned originally
-- Tier Boosts: Silver/Gold tiers get higher earnings or perks
-- Transfer Rules: Specific conversion rates with partner brands
-""")
-        
-    # Create sample shipping policy
-    with open(f"{doc_path}/return_policy.txt", "w") as f:
-        f.write("""
-Walmart Shipping Options
-
-Standard Shipping:
-- Free on orders over $35
-- 3-5 business days
-- Available for most items
-
-Express Shipping:
-- $5.99 flat rate
-- 2 business days
-- Available for eligible items
-
-NextDay Delivery:
-- $8.99 flat rate
-- Next business day delivery by 9pm
-- Available in select areas
-
-International Shipping:
-- Available to over 200 countries
-- Shipping costs vary by destination
-- Customs fees may apply
-""")
-    
-    # Create sample product catalog
-    with open(f"{doc_path}/return_policy.txt", "w") as f:
-        f.write("""
-Walmart Electronics Catalog
-
-1. Apple iPhone 15 Pro
-   - Price: $999
-   - Colors: Space Black, Silver, Gold, Blue
-   - Features: A17 Pro chip, 6.1" Super Retina XDR display, 48MP camera
-
-2. Samsung 65" QLED 4K Smart TV
-   - Price: $799
-   - Features: Quantum HDR, Object Tracking Sound, Smart Hub with streaming apps
-
-3. Sony WH-1000XM5 Wireless Headphones
-   - Price: $349
-   - Features: Industry-leading noise cancellation, 30-hour battery, multipoint connection
-
-4. Ninja Foodi 10-in-1 Air Fry Oven
-   - Price: $199
-   - Features: Air fry, roast, bake, toast, dehydrate functions, 1800W power
-""")
-    
-    with open(f"{doc_path}/return_policy.txt", "w") as f:
-        f.write("""
-Walmart Store Hours
-
-Regular Hours:
-- Monday-Sunday: 6:00 AM - 11:00 PM
-- Pharmacy: 9:00 AM - 8:00 PM (Mon-Fri), 9:00 AM - 6:00 PM (Sat-Sun)
-- Vision Center: 9:00 AM - 8:00 PM (Mon-Fri), 9:00 AM - 6:00 PM (Sat)
-
-Holiday Hours:
-- Thanksgiving: Closed
-- Christmas: Closed
-- New Year's Day: 10:00 AM - 8:00 PM
-- Other holidays may have modified hours
-
-Services:
-- Grocery Pickup: Available 8:00 AM - 8:00 PM
-- Delivery: Available in select areas
-- Auto Care Center: 7:00 AM - 7:00 PM
-""")
-    
-    logger.info("Sample documents created successfully")
-    return True
 
 def load_documents():
-    """Load and process documents from a directory"""
+    """Load .pdf and .txt files from DOC_PATH"""
     documents = []
-    
-    # Load PDF files
-    for pdf_file in glob.glob("documents/*.pdf"):
-        loader = PyPDFLoader(pdf_file)
-        pages = loader.load()
-        documents.extend(pages)
-    
-    # Load text files
-    for txt_file in glob.glob("documents/*.txt"):
+    for txt_file in glob.glob(f"{DOC_PATH}/*.txt"):
         loader = TextLoader(txt_file)
-        pages = loader.load()
-        documents.extend(pages)
-    
-    logger.info(f"Loaded {len(documents)} documents")
+        documents.extend(loader.load())
+    for pdf_file in glob.glob(f"{DOC_PATH}/*.pdf"):
+        loader = PyPDFLoader(pdf_file)
+        documents.extend(loader.load())
     return documents
 
-def initialize_qa_system():
-    """Initialize the QA system with documents and embeddings"""
+
+def initialize_qa():
+    """Initializes vectorstore and QA chain using LangChain & Groq"""
     global qa_chain, vectorstore
-    
     try:
-        # Get Groq API key from environment
+        # Validate Groq key
         groq_api_key = os.getenv("GROQ_API_KEY")
         if not groq_api_key:
-            raise ValueError("GROQ_API_KEY not found in .env file")
-        
-        # Create sample documents if they don't exist
-        if not os.path.exists("documents") or not os.listdir("documents"):
-            logger.info("Creating sample documents...")
-            setup_document_samples()
-        
-        # Load and process documents
-        documents = load_documents()
-        
-        if not documents:
-            logger.warning("No documents found. Creating fallback content.")
-            documents = [
-                Document(page_content="Walmart Return Policy: 90 days for most items", metadata={"source": "fallback.txt"}),
-                Document(page_content="Walmart Shipping: Free on orders over $35", metadata={"source": "fallback.txt"})
-            ]
-        
-        # Split documents
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-        docs = text_splitter.split_documents(documents)
-        
-        # Create embeddings
-        embedding_model = HuggingFaceEmbeddings(
+            raise ValueError("Missing GROQ_API_KEY")
+
+        # Ensure documents exist
+        if not os.listdir(DOC_PATH):
+            logger.info("No documents found. Creating samples...")
+            create_sample_documents()
+
+        # Load & split documents
+        raw_docs = load_documents()
+        if not raw_docs:
+            raw_docs = [Document(page_content="Fallback: Walmart Policy", metadata={"source": "default"})]
+
+        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        docs = splitter.split_documents(raw_docs)
+
+        # Embed with HuggingFace
+        embeddings = HuggingFaceEmbeddings(
             model_name="sentence-transformers/all-MiniLM-L6-v2",
             model_kwargs={"device": "cpu"}
         )
-        
-        # Create vector store
+
+        # Store embeddings
         vectorstore = Chroma.from_documents(
             documents=docs,
-            embedding=embedding_model,
-            persist_directory="./chroma_db"
+            embedding=embeddings,
+            persist_directory=DB_PATH
         )
-        
-        # Create prompt template
-        prompt_template = PromptTemplate(
+
+        # Prompt template
+        template = PromptTemplate(
             input_variables=["context", "question"],
             template="""
-You are Kendall, a helpful and friendly Walmart customer service assistant. Use the provided context to answer the customer's question accurately and helpfully.
-
-Guidelines:
-- Be conversational and friendly
-- Provide specific information when available
-- If you don't know something, say so and suggest contacting customer support
-- Always be helpful and solution-oriented
-- Use the context provided to give accurate answers
+You are Kendall, a friendly Walmart assistant. Use only the provided context to answer the customer's question.
 
 Context:
 {context}
 
-Customer Question:
+Question:
 {question}
 
-Your helpful response:
-""",
+Answer as Kendall:
+"""
         )
-        
-        # Set up Groq LLM
+
+        # LLM and QA chain
         llm = ChatGroq(
-            temperature=0.2,
             model_name="llama3-70b-8192",
+            temperature=0.2,
             api_key=groq_api_key
         )
-        
-        # Create QA chain
+
         qa_chain = RetrievalQA.from_chain_type(
             llm=llm,
             retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
             chain_type="stuff",
-            chain_type_kwargs={"prompt": prompt_template},
+            chain_type_kwargs={"prompt": template},
             return_source_documents=True
         )
-        
-        logger.info("QA system initialized successfully")
+
+        logger.info("QA system initialized.")
         return True
-        
+
     except Exception as e:
-        logger.error(f"Error initializing QA system: {str(e)}")
+        logger.exception(f"Failed to initialize QA system: {str(e)}")
         return False
 
+
+# Initialize QA on import (works with gunicorn)
+initialize_qa()
+
+
+# API Routes
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check endpoint"""
-    return jsonify({"status": "healthy", "message": "Walmart Chatbot API is running"})
+    return jsonify({"status": "healthy", "message": "Walmart Chatbot API is up"})
+
 
 @app.route('/chat', methods=['POST'])
 def chat():
-    """Main chat endpoint"""
     try:
         data = request.json
-        question = data.get('question', '').strip()
-        
+        question = data.get("question", "").strip()
+
         if not question:
-            logger.warning("Received empty question.")
-            return jsonify({
-                "answer": "Please enter a valid question.",
-                "sources": [],
-                "status": "error"
-            }), 400
-        
+            return jsonify({"answer": "Please enter a question.", "sources": [], "status": "error"}), 400
+
         if not qa_chain:
-            logger.error("QA system not initialized.")
-            return jsonify({
-                "answer": "Kendall is not ready yet. Please try again shortly.",
-                "sources": [],
-                "status": "error"
-            }), 500
-        
-        # Get answer from QA system
+            return jsonify({"answer": "Kendall is still warming up. Try again shortly.", "sources": [], "status": "error"}), 503
+
         result = qa_chain({"query": question})
-        
-        answer = result.get("result", "").strip()
-        if not answer:
-            logger.warning("QA system returned empty answer.")
-            answer = "I couldn't find a helpful answer for that. Please try rephrasing your question."
+        answer = result.get("result", "I'm not sure. Please rephrase.").strip()
 
-        # Extract sources
-        sources = []
-        if "source_documents" in result:
-            sources = list(set([
-                os.path.basename(doc.metadata.get('source', 'Unknown'))
-                for doc in result["source_documents"]
-            ]))
+        sources = list(set(
+            os.path.basename(doc.metadata.get('source', 'Unknown'))
+            for doc in result.get("source_documents", [])
+        ))
 
-        return jsonify({
-            "answer": answer,
-            "sources": sources,
-            "status": "success"
-        })
-        
+        return jsonify({"answer": answer, "sources": sources, "status": "success"})
+
     except Exception as e:
-        logger.exception("Error in chat endpoint")
+        logger.exception("Chat error")
         return jsonify({
-            "answer": "Sorry, I'm having trouble processing your request right now. Please try again later.",
+            "answer": "An error occurred. Please try again later.",
             "sources": [],
             "status": "error"
         }), 500
 
+
 @app.route('/reset', methods=['POST'])
 def reset_chat():
-    """Reset chat history endpoint"""
-    return jsonify({"message": "Chat reset successfully", "status": "success"})
+    return jsonify({"message": "Chat reset complete", "status": "success"})
 
-# if __name__ == '__main__':
-#     # Initialize QA system on startup
-#     logger.info("Starting Walmart Chatbot API...")
-#     if initialize_qa_system():
-#         logger.info("QA system ready!")
-#         app.run(debug=True, host='0.0.0.0', port=8000)
-#     else:
-#         logger.error("Failed to initialize QA system. Exiting.")
-#         exit(1)
 
-if __name__ == '__main__':
-    # Initialize QA system on startup
-    logger.info("Starting Walmart Chatbot API...")
-    if initialize_qa_system():
-        logger.info("QA system ready!")
-        # For production, use the port from environment
-        port = int(os.environ.get('PORT', 8000))
-        app.run(debug=False, host='0.0.0.0', port=port)
-    else:
-        logger.error("Failed to initialize QA system. Exiting.")
-        exit(1)
+# Optional: Local development server
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    logger.info(f"Running on http://localhost:{port}")
+    app.run(debug=True, host="0.0.0.0", port=port)
